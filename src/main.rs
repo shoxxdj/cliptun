@@ -1,0 +1,892 @@
+//! cliptun — POC de tunnel TCP à travers un presse-papier partagé.
+//!
+//!   navigateur ──SOCKS5──► [front] ──(presse-papier)──► [back] ──TCP──► serveur web (localhost de la VM)
+//!
+//! Protocole (half-duplex, maître/esclave) :
+//!   * le presse-papier est un slot unique, donc le front est le "maître" :
+//!     il écrit une trame F (numéro de séquence N, payload éventuellement vide),
+//!   * le back la lit, traite les messages, et répond par une trame B de même N
+//!     contenant ce qu'il a en attente (données renvoyées par le serveur, etc.),
+//!   * le front lit la réponse N, puis écrit la trame N+1, etc.
+//!   * si une trame se perd (sync du presse-papier capricieuse), le front la réécrit
+//!     après `--resend-ms` et le back réécrit sa réponse en cache s'il revoit le même N.
+//!
+//! Format d'une trame (texte, donc compatible presse-papier) :
+//!   CT2|<F|B>|<seq>|<base64(wire)>|<crc32 hex de wire>
+//!   wire = <flag> <corps>   flag 0 = corps brut, flag 1 = corps compressé (deflate)
+//!
+//! Corps = suite de messages binaires : Open / Opened / Data / Close (un par flux TCP).
+//! La compression est faite trame par trame (pas de contexte partagé) : une trame perdue
+//! ou réécrite reste toujours décodable seule. Le flag la rend négociable sans config :
+//! le récepteur décode ce qu'il reçoit, `--no-compress` ne concerne que l'émission.
+
+use anyhow::{Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{sleep, timeout};
+
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+macro_rules! vlog {
+    ($($a:tt)*) => { if VERBOSE.load(Ordering::Relaxed) { eprintln!($($a)*); } };
+}
+
+// ───────────────────────────── CLI ─────────────────────────────
+
+#[derive(Parser)]
+#[command(version, about = "Tunnel TCP/SOCKS5 à travers le presse-papier")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+    #[command(flatten)]
+    common: Common,
+}
+
+#[derive(Args, Clone)]
+struct Common {
+    /// Transport : presse-papier système, ou simple fichier partagé (pour tester sans VM)
+    #[arg(long, value_enum, default_value = "clipboard", global = true)]
+    backend: Backend,
+    /// Chemin du fichier pour --backend file
+    #[arg(long, global = true)]
+    file: Option<PathBuf>,
+    /// Taille max (octets bruts) du payload d'une trame
+    #[arg(long, default_value_t = 49152, global = true)]
+    chunk: usize,
+    /// Période de lecture du presse-papier (ms)
+    #[arg(long, default_value_t = 50, global = true)]
+    poll_ms: u64,
+    /// Période de polling du front quand il n'a rien à envoyer mais des flux ouverts (ms)
+    #[arg(long, default_value_t = 300, global = true)]
+    interval_ms: u64,
+    /// Délai avant de réécrire une trame restée sans réponse (ms)
+    #[arg(long, default_value_t = 5000, global = true)]
+    resend_ms: u64,
+    /// Désactive la compression des trames émises (la réception reste automatique)
+    #[arg(long, global = true)]
+    no_compress: bool,
+    /// Niveau de compression deflate (0-9)
+    #[arg(long, default_value_t = 6, global = true)]
+    level: u32,
+    /// Logs détaillés
+    #[arg(short, long, global = true)]
+    verbose: bool,
+}
+
+impl Common {
+    fn compression(&self) -> Option<u32> {
+        if self.no_compress {
+            None
+        } else {
+            Some(self.level.min(9))
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Côté navigateur : écoute SOCKS5 et pousse les flux dans le presse-papier
+    Front {
+        #[arg(long, default_value = "127.0.0.1:1080")]
+        listen: String,
+    },
+    /// Côté VM : lit le presse-papier et ouvre les connexions TCP réelles
+    Back {
+        /// Force toutes les connexions vers cette adresse (ignore la destination SOCKS),
+        /// ex. 127.0.0.1:8080
+        #[arg(long)]
+        connect_to: Option<String>,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum Backend {
+    Clipboard,
+    File,
+}
+
+// ───────────────────────────── Messages ─────────────────────────────
+
+#[derive(Debug)]
+enum Msg {
+    Open { id: u32, host: String, port: u16 },
+    Opened { id: u32, ok: bool, err: String },
+    Data { id: u32, data: Vec<u8> },
+    Close { id: u32 },
+}
+
+impl Msg {
+    fn id(&self) -> u32 {
+        match self {
+            Msg::Open { id, .. }
+            | Msg::Opened { id, .. }
+            | Msg::Data { id, .. }
+            | Msg::Close { id } => *id,
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            Msg::Open { host, .. } => 9 + host.len(),
+            Msg::Opened { err, .. } => 8 + err.len(),
+            Msg::Data { data, .. } => 9 + data.len(),
+            Msg::Close { .. } => 5,
+        }
+    }
+
+    fn encode(&self, o: &mut Vec<u8>) {
+        match self {
+            Msg::Open { id, host, port } => {
+                o.push(1);
+                o.extend_from_slice(&id.to_be_bytes());
+                o.extend_from_slice(&port.to_be_bytes());
+                o.extend_from_slice(&(host.len() as u16).to_be_bytes());
+                o.extend_from_slice(host.as_bytes());
+            }
+            Msg::Opened { id, ok, err } => {
+                o.push(2);
+                o.extend_from_slice(&id.to_be_bytes());
+                o.push(*ok as u8);
+                o.extend_from_slice(&(err.len() as u16).to_be_bytes());
+                o.extend_from_slice(err.as_bytes());
+            }
+            Msg::Data { id, data } => {
+                o.push(3);
+                o.extend_from_slice(&id.to_be_bytes());
+                o.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                o.extend_from_slice(data);
+            }
+            Msg::Close { id } => {
+                o.push(4);
+                o.extend_from_slice(&id.to_be_bytes());
+            }
+        }
+    }
+}
+
+struct Rd<'a>(&'a [u8]);
+impl<'a> Rd<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if self.0.len() < n {
+            bail!("message tronqué");
+        }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Ok(a)
+    }
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into()?))
+    }
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into()?))
+    }
+}
+
+fn decode_all(b: &[u8]) -> Result<Vec<Msg>> {
+    let mut r = Rd(b);
+    let mut v = Vec::new();
+    while !r.0.is_empty() {
+        match r.u8()? {
+            1 => {
+                let id = r.u32()?;
+                let port = r.u16()?;
+                let hl = r.u16()? as usize;
+                let host = String::from_utf8_lossy(r.take(hl)?).into_owned();
+                v.push(Msg::Open { id, host, port });
+            }
+            2 => {
+                let id = r.u32()?;
+                let ok = r.u8()? != 0;
+                let el = r.u16()? as usize;
+                let err = String::from_utf8_lossy(r.take(el)?).into_owned();
+                v.push(Msg::Opened { id, ok, err });
+            }
+            3 => {
+                let id = r.u32()?;
+                let len = r.u32()? as usize;
+                v.push(Msg::Data {
+                    id,
+                    data: r.take(len)?.to_vec(),
+                });
+            }
+            4 => v.push(Msg::Close { id: r.u32()? }),
+            t => bail!("type de message inconnu: {t}"),
+        }
+    }
+    Ok(v)
+}
+
+fn build_payload(pending: &mut VecDeque<Msg>, chunk: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(m) = pending.front() {
+        if !out.is_empty() && out.len() + m.size() > chunk {
+            break;
+        }
+        pending.pop_front().unwrap().encode(&mut out);
+    }
+    out
+}
+
+// ───────────────────────────── Trames ─────────────────────────────
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+/// Taille max d'un corps décompressé (protège contre une "bombe" de décompression).
+const MAX_BODY: u64 = 16 * 1024 * 1024;
+
+/// Compresse si ça vaut le coup ; renvoie `[flag][corps]`.
+fn pack(body: &[u8], level: Option<u32>) -> Vec<u8> {
+    if let Some(l) = level {
+        if body.len() >= 64 {
+            let mut enc =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(l));
+            if std::io::Write::write_all(&mut enc, body).is_ok() {
+                if let Ok(z) = enc.finish() {
+                    if z.len() < body.len() {
+                        let mut w = Vec::with_capacity(z.len() + 1);
+                        w.push(1);
+                        w.extend_from_slice(&z);
+                        return w;
+                    }
+                }
+            }
+        }
+    }
+    let mut w = Vec::with_capacity(body.len() + 1);
+    w.push(0);
+    w.extend_from_slice(body);
+    w
+}
+
+fn unpack(wire: &[u8]) -> Option<Vec<u8>> {
+    let (flag, rest) = wire.split_first()?;
+    match flag {
+        0 => Some(rest.to_vec()),
+        1 => {
+            let dec = flate2::read::DeflateDecoder::new(rest);
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(dec, MAX_BODY + 1), &mut out)
+                .ok()?;
+            if out.len() as u64 > MAX_BODY {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn make_frame(dir: char, seq: u64, body: &[u8], level: Option<u32>) -> String {
+    let wire = pack(body, level);
+    vlog!(
+        "frame {dir}{seq}: corps {} o → fil {} o",
+        body.len(),
+        wire.len()
+    );
+    format!(
+        "CT2|{}|{}|{}|{:08x}",
+        dir,
+        seq,
+        B64.encode(&wire),
+        crc32(&wire)
+    )
+}
+
+fn parse_frame(s: &str) -> Option<(char, u64, Vec<u8>)> {
+    // certains outils de sync du presse-papier ajoutent/modifient des blancs
+    if !s.trim_start().starts_with("CT2") {
+        return None;
+    }
+    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut it = s.split('|');
+    if it.next()? != "CT2" {
+        return None;
+    }
+    let dir = it.next()?.chars().next()?;
+    let seq: u64 = it.next()?.parse().ok()?;
+    let wire = B64.decode(it.next()?).ok()?;
+    let crc = u32::from_str_radix(it.next()?, 16).ok()?;
+    if it.next().is_some() || crc32(&wire) != crc {
+        return None;
+    }
+    Some((dir, seq, unpack(&wire)?))
+}
+
+// ───────────────────────────── Transport presse-papier ─────────────────────────────
+
+trait Clip {
+    fn get(&mut self) -> Option<String>;
+    fn set(&mut self, s: &str) -> Result<()>;
+}
+
+struct FileClip {
+    path: PathBuf,
+}
+impl Clip for FileClip {
+    fn get(&mut self) -> Option<String> {
+        std::fs::read_to_string(&self.path).ok()
+    }
+    fn set(&mut self, s: &str) -> Result<()> {
+        let tmp = self
+            .path
+            .with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, s)?;
+        std::fs::rename(&tmp, &self.path)?; // écriture atomique
+        Ok(())
+    }
+}
+
+#[cfg(feature = "clip")]
+struct SysClip(arboard::Clipboard);
+#[cfg(feature = "clip")]
+impl Clip for SysClip {
+    fn get(&mut self) -> Option<String> {
+        self.0.get_text().ok()
+    }
+    fn set(&mut self, s: &str) -> Result<()> {
+        self.0.set_text(s.to_string())?;
+        Ok(())
+    }
+}
+
+enum ClipCmd {
+    Get(oneshot::Sender<Option<String>>),
+    Set(String, oneshot::Sender<()>),
+}
+
+/// Le presse-papier vit dans un thread dédié (certaines plateformes exigent que
+/// l'objet reste sur le thread qui l'a créé, et X11 doit garder le propriétaire en vie).
+#[derive(Clone)]
+struct ClipHandle {
+    tx: std::sync::mpsc::Sender<ClipCmd>,
+}
+
+impl ClipHandle {
+    fn spawn(make: impl FnOnce() -> Result<Box<dyn Clip>> + Send + 'static) -> Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<ClipCmd>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        std::thread::spawn(move || {
+            let mut clip = match make() {
+                Ok(c) => {
+                    let _ = ready_tx.send(Ok(()));
+                    c
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e.to_string()));
+                    return;
+                }
+            };
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    ClipCmd::Get(r) => {
+                        let _ = r.send(clip.get());
+                    }
+                    ClipCmd::Set(s, r) => {
+                        if let Err(e) = clip.set(&s) {
+                            eprintln!("erreur d'écriture presse-papier: {e}");
+                        }
+                        let _ = r.send(());
+                    }
+                }
+            }
+        });
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(ClipHandle { tx }),
+            Ok(Err(e)) => bail!("initialisation du presse-papier impossible: {e}"),
+            Err(e) => bail!("thread presse-papier: {e}"),
+        }
+    }
+
+    async fn get(&self) -> Option<String> {
+        let (o, r) = oneshot::channel();
+        self.tx.send(ClipCmd::Get(o)).ok()?;
+        r.await.ok().flatten()
+    }
+
+    async fn set(&self, s: String) {
+        let (o, r) = oneshot::channel();
+        if self.tx.send(ClipCmd::Set(s, o)).is_ok() {
+            let _ = r.await;
+        }
+    }
+}
+
+fn make_clip(c: &Common) -> Result<ClipHandle> {
+    match c.backend {
+        Backend::File => {
+            let path = c
+                .file
+                .clone()
+                .unwrap_or_else(|| std::env::temp_dir().join("cliptun.clip"));
+            eprintln!("transport: fichier {}", path.display());
+            ClipHandle::spawn(move || Ok(Box::new(FileClip { path }) as Box<dyn Clip>))
+        }
+        Backend::Clipboard => {
+            #[cfg(feature = "clip")]
+            {
+                ClipHandle::spawn(|| {
+                    Ok(Box::new(SysClip(arboard::Clipboard::new()?)) as Box<dyn Clip>)
+                })
+            }
+            #[cfg(not(feature = "clip"))]
+            {
+                bail!("compilé sans la feature `clip` ; utilise --backend file")
+            }
+        }
+    }
+}
+
+// ───────────────────────────── FRONT ─────────────────────────────
+
+struct Shared {
+    streams: Mutex<HashMap<u32, mpsc::UnboundedSender<Msg>>>,
+    next_id: AtomicU32,
+    out: mpsc::Sender<Msg>,
+    read_buf: usize,
+}
+
+async fn socks_reply(s: &mut TcpStream, code: u8) -> Result<()> {
+    s.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+    Ok(())
+}
+
+async fn handle_socks(mut sock: TcpStream, shared: Arc<Shared>) -> Result<()> {
+    // — handshake SOCKS5 (sans authentification) —
+    let mut hdr = [0u8; 2];
+    sock.read_exact(&mut hdr).await?;
+    if hdr[0] != 5 {
+        bail!("pas du SOCKS5");
+    }
+    let mut methods = vec![0u8; hdr[1] as usize];
+    sock.read_exact(&mut methods).await?;
+    if !methods.contains(&0) {
+        sock.write_all(&[5, 0xFF]).await?;
+        bail!("méthode d'auth non supportée");
+    }
+    sock.write_all(&[5, 0]).await?;
+
+    let mut req = [0u8; 4];
+    sock.read_exact(&mut req).await?;
+    if req[0] != 5 || req[1] != 1 {
+        socks_reply(&mut sock, 0x07).await?; // seul CONNECT est supporté
+        bail!("commande SOCKS non supportée: {}", req[1]);
+    }
+    let host = match req[3] {
+        1 => {
+            let mut a = [0u8; 4];
+            sock.read_exact(&mut a).await?;
+            std::net::Ipv4Addr::from(a).to_string()
+        }
+        3 => {
+            let mut l = [0u8; 1];
+            sock.read_exact(&mut l).await?;
+            let mut d = vec![0u8; l[0] as usize];
+            sock.read_exact(&mut d).await?;
+            String::from_utf8_lossy(&d).into_owned()
+        }
+        4 => {
+            let mut a = [0u8; 16];
+            sock.read_exact(&mut a).await?;
+            std::net::Ipv6Addr::from(a).to_string()
+        }
+        _ => {
+            socks_reply(&mut sock, 0x08).await?;
+            bail!("type d'adresse inconnu");
+        }
+    };
+    let mut p = [0u8; 2];
+    sock.read_exact(&mut p).await?;
+    let port = u16::from_be_bytes(p);
+
+    // — ouverture du flux côté back —
+    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    shared.streams.lock().unwrap().insert(id, tx);
+    vlog!("[{id}] CONNECT {host}:{port}");
+    shared.out.send(Msg::Open { id, host, port }).await?;
+
+    let first = timeout(Duration::from_secs(90), rx.recv()).await;
+    match first {
+        Ok(Some(Msg::Opened { ok: true, .. })) => socks_reply(&mut sock, 0x00).await?,
+        Ok(Some(Msg::Opened { ok: false, err, .. })) => {
+            socks_reply(&mut sock, 0x05).await?;
+            shared.streams.lock().unwrap().remove(&id);
+            bail!("[{id}] refusé par le back: {err}");
+        }
+        _ => {
+            socks_reply(&mut sock, 0x04).await?;
+            shared.streams.lock().unwrap().remove(&id);
+            bail!("[{id}] pas de réponse du back");
+        }
+    }
+
+    // — pompage bidirectionnel —
+    let (mut r, mut w) = sock.into_split();
+    let out = shared.out.clone();
+    let bufsize = shared.read_buf;
+    let reader = async {
+        let mut buf = vec![0u8; bufsize];
+        loop {
+            match r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if out
+                        .send(Msg::Data {
+                            id,
+                            data: buf[..n].to_vec(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    let writer = async {
+        while let Some(m) = rx.recv().await {
+            match m {
+                Msg::Data { data, .. } => {
+                    if w.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                Msg::Close { .. } => break,
+                _ => {}
+            }
+        }
+        let _ = w.shutdown().await;
+    };
+    tokio::select! { _ = reader => {}, _ = writer => {} }
+    let _ = shared.out.send(Msg::Close { id }).await; // redondant mais inoffensif
+    shared.streams.lock().unwrap().remove(&id);
+    vlog!("[{id}] fermé");
+    Ok(())
+}
+
+/// Envoie la trame et attend la réponse portant le même numéro de séquence.
+async fn exchange(clip: &ClipHandle, frame: &str, seq: u64, want: char, c: &Common) -> Vec<u8> {
+    clip.set(frame.to_string()).await;
+    let mut last_write = Instant::now();
+    loop {
+        sleep(Duration::from_millis(c.poll_ms)).await;
+        if let Some(t) = clip.get().await {
+            if let Some((d, s, p)) = parse_frame(&t) {
+                if d == want && s == seq {
+                    return p;
+                }
+            }
+        }
+        if last_write.elapsed() > Duration::from_millis(c.resend_ms) {
+            vlog!("front: pas de réponse pour seq={seq}, réécriture de la trame");
+            clip.set(frame.to_string()).await;
+            last_write = Instant::now();
+        }
+    }
+}
+
+async fn front_tunnel(
+    clip: ClipHandle,
+    shared: Arc<Shared>,
+    mut out_rx: mpsc::Receiver<Msg>,
+    c: Common,
+) {
+    let mut pending: VecDeque<Msg> = VecDeque::new();
+    // le numéro de séquence démarre à l'epoch (ms) : un front relancé repart toujours "au-dessus"
+    let mut seq: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1);
+    loop {
+        while let Ok(m) = out_rx.try_recv() {
+            pending.push_back(m);
+        }
+        let active = !shared.streams.lock().unwrap().is_empty();
+        if pending.is_empty() && !active {
+            // rien à faire : on ne touche pas au presse-papier
+            match out_rx.recv().await {
+                Some(m) => pending.push_back(m),
+                None => return,
+            }
+            continue;
+        }
+
+        let payload = build_payload(&mut pending, c.chunk);
+        seq += 1;
+        let frame = make_frame('F', seq, &payload, c.compression());
+        vlog!("front: → seq={seq} ({} o)", payload.len());
+        let resp = exchange(&clip, &frame, seq, 'B', &c).await;
+        let msgs = match decode_all(&resp) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("front: réponse illisible: {e}");
+                vec![]
+            }
+        };
+        vlog!("front: ← seq={seq} ({} o, {} msg)", resp.len(), msgs.len());
+        let got = !msgs.is_empty();
+        for m in msgs {
+            let id = m.id();
+            let end = matches!(m, Msg::Close { .. }) || matches!(m, Msg::Opened { ok: false, .. });
+            let tx = shared.streams.lock().unwrap().get(&id).cloned();
+            if let Some(tx) = tx {
+                let _ = tx.send(m);
+            }
+            if end {
+                shared.streams.lock().unwrap().remove(&id);
+            }
+        }
+
+        if payload.is_empty() && !got && pending.is_empty() {
+            // inactif : on attend `interval` ou un nouveau message à envoyer
+            tokio::select! {
+                _ = sleep(Duration::from_millis(c.interval_ms)) => {}
+                m = out_rx.recv() => { if let Some(m) = m { pending.push_back(m); } }
+            }
+        }
+    }
+}
+
+async fn run_front(clip: ClipHandle, c: Common, listen: String) -> Result<()> {
+    let (out_tx, out_rx) = mpsc::channel::<Msg>(256);
+    let shared = Arc::new(Shared {
+        streams: Mutex::new(HashMap::new()),
+        next_id: AtomicU32::new(1),
+        out: out_tx,
+        read_buf: c.chunk.saturating_sub(64).clamp(256, 32768),
+    });
+    tokio::spawn(front_tunnel(clip, shared.clone(), out_rx, c));
+
+    let listener = TcpListener::bind(&listen).await?;
+    eprintln!("front: SOCKS5 en écoute sur {listen}");
+    loop {
+        let (sock, peer) = listener.accept().await?;
+        vlog!("front: client {peer}");
+        let sh = shared.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_socks(sock, sh).await {
+                vlog!("front: {e}");
+            }
+        });
+    }
+}
+
+// ───────────────────────────── BACK ─────────────────────────────
+
+type Streams = Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Msg>>>>;
+
+fn parse_hostport(s: &str) -> Result<(String, u16)> {
+    let (h, p) = s
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("format attendu host:port"))?;
+    Ok((h.trim_matches(['[', ']']).to_string(), p.parse()?))
+}
+
+async fn target_task(
+    id: u32,
+    host: String,
+    port: u16,
+    mut rx: mpsc::UnboundedReceiver<Msg>,
+    out: mpsc::UnboundedSender<Msg>,
+    streams: Streams,
+    bufsize: usize,
+) {
+    let fail = |err: String| {
+        let _ = out.send(Msg::Opened { id, ok: false, err });
+        streams.lock().unwrap().remove(&id);
+    };
+    let sock = match timeout(
+        Duration::from_secs(10),
+        TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return fail(e.to_string()),
+        Err(_) => return fail("timeout".into()),
+    };
+    vlog!("back: [{id}] connecté à {host}:{port}");
+    let _ = out.send(Msg::Opened {
+        id,
+        ok: true,
+        err: String::new(),
+    });
+
+    let (mut r, mut w) = sock.into_split();
+    let out2 = out.clone();
+    let reader = async move {
+        let mut buf = vec![0u8; bufsize];
+        loop {
+            match r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if out2
+                        .send(Msg::Data {
+                            id,
+                            data: buf[..n].to_vec(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = out2.send(Msg::Close { id });
+    };
+    let writer = async move {
+        while let Some(m) = rx.recv().await {
+            match m {
+                Msg::Data { data, .. } => {
+                    if w.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                Msg::Close { .. } => break,
+                _ => {}
+            }
+        }
+        let _ = w.shutdown().await;
+    };
+    tokio::select! { _ = reader => {}, _ = writer => {} }
+    streams.lock().unwrap().remove(&id);
+    vlog!("back: [{id}] fermé");
+}
+
+async fn run_back(clip: ClipHandle, c: Common, connect_to: Option<String>) -> Result<()> {
+    let fixed = connect_to.as_deref().map(parse_hostport).transpose()?;
+    let streams: Streams = Arc::new(Mutex::new(HashMap::new()));
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Msg>();
+    let bufsize = c.chunk.saturating_sub(64).clamp(256, 32768);
+
+    let mut pending: VecDeque<Msg> = VecDeque::new();
+    let mut last_seq: u64 = 0;
+    let mut cached: Option<String> = None;
+    let mut last_rewrite = Instant::now();
+
+    match &fixed {
+        Some((h, p)) => eprintln!("back: toutes les connexions → {h}:{p}"),
+        None => eprintln!("back: relais TCP activé, destinations prises depuis les trames SOCKS5"),
+    }
+    eprintln!("back: en attente de trames…");
+
+    loop {
+        sleep(Duration::from_millis(c.poll_ms)).await;
+        let Some(text) = clip.get().await else {
+            continue;
+        };
+        let Some((dir, seq, payload)) = parse_frame(&text) else {
+            continue;
+        };
+        if dir != 'F' {
+            continue;
+        }
+        if seq == last_seq {
+            // le front n'a pas vu notre réponse : on la réécrit (au plus toutes les resend_ms)
+            if last_rewrite.elapsed() > Duration::from_millis(c.resend_ms) {
+                if let Some(f) = &cached {
+                    vlog!("back: doublon seq={seq}, réécriture de la réponse");
+                    clip.set(f.clone()).await;
+                    last_rewrite = Instant::now();
+                }
+            }
+            continue;
+        }
+        if seq < last_seq {
+            continue; // trame périmée
+        }
+
+        match decode_all(&payload) {
+            Err(e) => eprintln!("back: trame illisible: {e}"),
+            Ok(msgs) => {
+                vlog!(
+                    "back: ← seq={seq} ({} o, {} msg)",
+                    payload.len(),
+                    msgs.len()
+                );
+                for m in msgs {
+                    match m {
+                        Msg::Open { id, host, port } => {
+                            // Sans --connect-to, on rejoue la destination demandée
+                            // par le client SOCKS5 depuis le réseau de la machine back.
+                            let (h, p) = fixed.clone().unwrap_or_else(|| (host.clone(), port));
+                            let (tx, rx) = mpsc::unbounded_channel();
+                            streams.lock().unwrap().insert(id, tx);
+                            tokio::spawn(target_task(
+                                id,
+                                h,
+                                p,
+                                rx,
+                                out_tx.clone(),
+                                streams.clone(),
+                                bufsize,
+                            ));
+                        }
+                        Msg::Data { id, data } => {
+                            let tx = streams.lock().unwrap().get(&id).cloned();
+                            if let Some(tx) = tx {
+                                let _ = tx.send(Msg::Data { id, data });
+                            }
+                        }
+                        Msg::Close { id } => {
+                            let tx = streams.lock().unwrap().get(&id).cloned();
+                            if let Some(tx) = tx {
+                                let _ = tx.send(Msg::Close { id });
+                            }
+                        }
+                        Msg::Opened { .. } => {}
+                    }
+                }
+            }
+        }
+
+        last_seq = seq;
+        while let Ok(m) = out_rx.try_recv() {
+            pending.push_back(m);
+        }
+        let resp = build_payload(&mut pending, c.chunk);
+        vlog!("back: → seq={seq} ({} o)", resp.len());
+        let frame = make_frame('B', seq, &resp, c.compression());
+        clip.set(frame.clone()).await;
+        cached = Some(frame);
+        last_rewrite = Instant::now();
+    }
+}
+
+// ───────────────────────────── main ─────────────────────────────
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    VERBOSE.store(cli.common.verbose, Ordering::Relaxed);
+    let clip = make_clip(&cli.common)?;
+    match cli.cmd {
+        Cmd::Front { listen } => run_front(clip, cli.common, listen).await,
+        Cmd::Back { connect_to } => run_back(clip, cli.common, connect_to).await,
+    }
+}
