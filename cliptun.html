@@ -1,0 +1,517 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>cliptun</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Layout concept: a vertical "wire" running down the page, like the clipboard
+   acting as a single shared channel between two isolated machines — Front and
+   Back sit as two terminal-like panels connected only by that wire. */
+:root{
+  --bg:#f3f1ea;
+  --surface:#ffffff;
+  --ink:#1c1a16;
+  --muted:#6b6459;
+  --line:#ded8c9;
+  --accent:#2f6e5e;
+  --accent-ink:#eef6f2;
+  --code-bg:#17201c;
+  --code-ink:#d9f0e4;
+  --warn-bg:#fbeee0;
+  --warn-ink:#5a3a16;
+  --warn-line:#e3c79a;
+  --radius:10px;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#15181a;
+    --surface:#1d2224;
+    --ink:#eceae4;
+    --muted:#9a9488;
+    --line:#333a3c;
+    --accent:#6bbfa4;
+    --accent-ink:#0d1a16;
+    --code-bg:#0e1412;
+    --code-ink:#b9ead5;
+    --warn-bg:#2a2016;
+    --warn-ink:#f0d4a6;
+    --warn-line:#4a3a22;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#15181a;
+  --surface:#1d2224;
+  --ink:#eceae4;
+  --muted:#9a9488;
+  --line:#333a3c;
+  --accent:#6bbfa4;
+  --accent-ink:#0d1a16;
+  --code-bg:#0e1412;
+  --code-ink:#b9ead5;
+  --warn-bg:#2a2016;
+  --warn-ink:#f0d4a6;
+  --warn-line:#4a3a22;
+  color-scheme:dark;
+}
+
+*{box-sizing:border-box;}
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--ink);
+  font-family:'IBM Plex Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  line-height:1.5;
+}
+::selection{background:var(--accent);color:var(--accent-ink);}
+
+.wrap{
+  max-width:860px;
+  margin:0 auto;
+  padding-left:max(20px, env(safe-area-inset-left,0px));
+  padding-right:max(20px, env(safe-area-inset-right,0px));
+}
+
+h1,h2,h3{font-family:'Fraunces',Georgia,'Times New Roman',serif;font-weight:600;letter-spacing:-0.01em;text-wrap:balance;margin:0;}
+code,pre,.mono{font-family:'IBM Plex Mono','SF Mono',Consolas,monospace;}
+
+a{color:var(--accent);}
+
+/* ---------- Hero ---------- */
+header.hero{
+  padding-block:56px 40px;
+  border-bottom:1px solid var(--line);
+}
+.eyebrow{
+  font-family:'IBM Plex Mono',monospace;
+  font-size:12.5px;
+  letter-spacing:.14em;
+  text-transform:uppercase;
+  color:var(--accent);
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin-bottom:18px;
+}
+.eyebrow .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none;}
+h1.title{font-size:clamp(2.1rem,6vw,3.4rem);line-height:1.04;max-width:14ch;}
+h1.title em{font-style:normal;color:var(--accent);}
+.tagline{
+  margin-top:18px;
+  font-size:clamp(1.02rem,2.4vw,1.2rem);
+  color:var(--muted);
+  max-width:46ch;
+}
+.hero-actions{
+  display:flex;
+  flex-wrap:wrap;
+  gap:12px;
+  margin-top:28px;
+}
+.btn{
+  font-family:'IBM Plex Mono',monospace;
+  font-size:13.5px;
+  padding:11px 18px;
+  border-radius:999px;
+  text-decoration:none;
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  border:1px solid var(--line);
+  color:var(--ink);
+  transition:border-color .15s ease, transform .15s ease;
+}
+.btn:hover{border-color:var(--accent); transform:translateY(-1px);}
+.btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);}
+.btn.primary:hover{opacity:.92;}
+
+/* ---------- Schema: Front / wire / Back ---------- */
+.schema{
+  margin-top:40px;
+  display:grid;
+  grid-template-columns:1fr auto 1fr;
+  align-items:stretch;
+  gap:0;
+}
+.node{
+  background:var(--surface);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  padding:18px 18px 16px;
+  min-width:0;
+}
+.node .role{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);}
+.node h3{font-size:1.05rem;margin-top:4px;}
+.node p{margin:6px 0 0;font-size:13.5px;color:var(--muted);}
+.wire-col{
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  padding:0 14px;
+  gap:6px;
+  min-width:64px;
+}
+.wire-col svg{width:100%;height:46px;}
+.wire-label{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);text-align:center;letter-spacing:.04em;}
+
+@media (max-width:620px){
+  .schema{grid-template-columns:1fr;}
+  .wire-col{flex-direction:row;padding:10px 0;height:auto;}
+  .wire-col svg{width:46px;height:28px;transform:rotate(90deg);}
+}
+
+/* ---------- Sections ---------- */
+main{padding-block:48px;}
+section{padding-block:40px;border-top:1px solid var(--line);}
+section:first-child{border-top:none;}
+.section-head{margin-bottom:22px;}
+.section-head .num{font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--accent);letter-spacing:.08em;}
+.section-head h2{font-size:clamp(1.4rem,3.4vw,1.8rem);margin-top:6px;}
+.section-head .sub{color:var(--muted);margin-top:8px;max-width:58ch;font-size:15px;}
+
+.feature-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+  gap:1px;
+  background:var(--line);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  overflow:hidden;
+}
+.feature{background:var(--surface);padding:20px;}
+.feature .k{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--accent);letter-spacing:.06em;text-transform:uppercase;}
+.feature h3{font-size:16px;margin-top:8px;}
+.feature p{font-size:13.5px;color:var(--muted);margin:8px 0 0;}
+
+/* tabs for examples */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:0;}
+.tab-btn{
+  font-family:'IBM Plex Mono',monospace;
+  font-size:12.5px;
+  background:none;border:none;
+  color:var(--muted);
+  padding:10px 4px;
+  margin-right:18px;
+  cursor:pointer;
+  border-bottom:2px solid transparent;
+  transform:translateY(1px);
+}
+.tab-btn[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--accent);}
+.tab-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+.tab-panel{display:none;}
+.tab-panel.active{display:block;}
+
+.code-block{
+  background:var(--code-bg);
+  color:var(--code-ink);
+  border-radius:var(--radius);
+  padding:16px 16px 14px;
+  margin-top:16px;
+  overflow-x:auto;
+  position:relative;
+}
+.code-block pre{margin:0;font-size:13px;line-height:1.65;white-space:pre;}
+.code-block .comment{opacity:.55;}
+.copy-btn{
+  position:absolute;
+  top:10px;right:10px;
+  font-family:'IBM Plex Mono',monospace;
+  font-size:11px;
+  background:rgba(255,255,255,.08);
+  color:var(--code-ink);
+  border:1px solid rgba(255,255,255,.18);
+  border-radius:6px;
+  padding:5px 9px;
+  cursor:pointer;
+}
+.copy-btn:hover{background:rgba(255,255,255,.16);}
+.step-label{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin:18px 0 4px;}
+.step-label:first-child{margin-top:0;}
+
+/* protocol table */
+table{border-collapse:collapse;width:100%;font-size:13.5px;}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);}
+th{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500;}
+td.mono-cell{font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--accent);}
+.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:var(--radius);}
+.table-wrap table{min-width:420px;}
+.table-wrap .table-inner{padding:0;}
+
+.pill-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;}
+.pill{
+  font-family:'IBM Plex Mono',monospace;
+  font-size:11.5px;
+  border:1px solid var(--line);
+  border-radius:999px;
+  padding:5px 11px;
+  color:var(--muted);
+}
+
+/* disclaimer */
+.disclaimer{
+  background:var(--warn-bg);
+  border:1px solid var(--warn-line);
+  border-radius:var(--radius);
+  padding:22px 22px 20px;
+  color:var(--warn-ink);
+}
+.disclaimer h2{font-size:1.15rem;color:var(--warn-ink);}
+.disclaimer ul{margin:14px 0 0;padding-left:20px;}
+.disclaimer li{margin-bottom:9px;font-size:14px;line-height:1.55;}
+.disclaimer li::marker{color:var(--accent);}
+
+footer{
+  border-top:1px solid var(--line);
+  padding-block:28px;
+  padding-bottom:max(28px, env(safe-area-inset-bottom,0px));
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:12px;
+  font-size:13px;
+  color:var(--muted);
+}
+footer a{color:var(--muted);text-decoration:none;border-bottom:1px solid var(--line);}
+footer a:hover{color:var(--accent);border-color:var(--accent);}
+
+@media (prefers-reduced-motion: no-preference){
+  .btn{transition:border-color .15s ease, transform .15s ease;}
+}
+</style>
+
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow"><span class="dot"></span>Rust · Proof of concept</div>
+  <h1 class="title">A TCP tunnel that rides the <em>clipboard</em>.</h1>
+  <p class="tagline">cliptun moves network traffic between two machines that share nothing but a copy/paste buffer — no socket between them, ever. Compressed, optionally encrypted, built for environments where the clipboard is the only bridge you've got.</p>
+  <div class="hero-actions">
+    <a class="btn primary" href="https://github.com/shoxxdj/cliptun" target="_blank" rel="noopener">View on GitHub →</a>
+    <a class="btn" href="#usage">Jump to usage</a>
+  </div>
+
+  <div class="schema">
+    <div class="node">
+      <div class="role">Front</div>
+      <h3>Proxy entry point</h3>
+      <p>SOCKS5 / SOCKS4(a) / HTTP CONNECT / plain HTTP, auto-detected on one port.</p>
+    </div>
+    <div class="wire-col">
+      <svg viewBox="0 0 100 46" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <line x1="4" y1="23" x2="96" y2="23" stroke="var(--accent)" stroke-width="2" stroke-dasharray="1 7" stroke-linecap="round"/>
+        <path d="M86 15 L96 23 L86 31" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div class="wire-label">clipboard</div>
+    </div>
+    <div class="node">
+      <div class="role">Back</div>
+      <h3>TCP connector</h3>
+      <p>Opens the real connection from its own network — a scoped, isolated VM, typically.</p>
+    </div>
+  </div>
+</header>
+
+<main>
+
+  <section id="why">
+    <div class="section-head">
+      <div class="num">01</div>
+      <h2>Why a clipboard</h2>
+      <p class="sub">The design target: a browser on one machine, redirected through a local SOCKS proxy, ultimately reaching a web server running on an isolated VM that exposes nothing except its shared clipboard.</p>
+    </div>
+    <div class="feature-grid">
+      <div class="feature">
+        <div class="k">No network peer</div>
+        <h3>Zero direct connection</h3>
+        <p>Front and Back never open a socket to each other. Every frame travels as text through the shared clipboard.</p>
+      </div>
+      <div class="feature">
+        <div class="k">Protected</div>
+        <h3>Compressed by default</h3>
+        <p>Streaming zstd on both directions, primed with an HTTP dictionary, so repeated headers shrink fast.</p>
+      </div>
+      <div class="feature">
+        <div class="k">Optional</div>
+        <h3>Authenticated encryption</h3>
+        <p>XChaCha20-Poly1305 per frame with <code>--encrypt</code>, plus CRC32 integrity checks on every frame.</p>
+      </div>
+      <div class="feature">
+        <div class="k">Pluggable</div>
+        <h3>File transport too</h3>
+        <p>Swap the clipboard for a shared file — handy for testing, or headless environments with no clipboard at all.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="usage">
+    <div class="section-head">
+      <div class="num">02</div>
+      <h2>Usage</h2>
+      <p class="sub">Back runs where the network access lives. Front runs on the client and exposes a local proxy. Pick a transport — clipboard or a shared file.</p>
+    </div>
+
+    <div class="tabs" role="tablist" aria-label="Transport example">
+      <button class="tab-btn" role="tab" id="tab-clip" aria-selected="true" aria-controls="panel-clip">Clipboard</button>
+      <button class="tab-btn" role="tab" id="tab-file" aria-selected="false" aria-controls="panel-file" tabindex="-1">File</button>
+    </div>
+
+    <div class="tab-panel active" id="panel-clip" role="tabpanel" aria-labelledby="tab-clip">
+      <div class="step-label">On the isolated machine</div>
+      <div class="code-block">
+        <button class="copy-btn" data-copy="./cliptun back">Copy</button>
+        <pre>./cliptun back</pre>
+      </div>
+      <div class="step-label">On the client machine</div>
+      <div class="code-block">
+        <button class="copy-btn" data-copy="./cliptun front --listen 127.0.0.1:1080">Copy</button>
+        <pre>./cliptun front --listen 127.0.0.1:1080</pre>
+      </div>
+      <div class="step-label">Point an app at the proxy</div>
+      <div class="code-block">
+        <button class="copy-btn" data-copy="curl --socks5-hostname 127.0.0.1:1080 http://example.test/">Copy</button>
+        <pre>curl --socks5-hostname 127.0.0.1:1080 http://example.test/</pre>
+      </div>
+      <p style="font-size:13.5px;color:var(--muted);margin-top:14px;">No destination filter on Back means only loopback (<code>localhost</code>, <code>127.0.0.1</code>, <code>::1</code>) is reachable by default. Open it up with <code>--allow</code>, or pin every connection with <code>--connect-to</code>.</p>
+    </div>
+
+    <div class="tab-panel" id="panel-file" role="tabpanel" aria-labelledby="tab-file">
+      <div class="step-label">On the isolated machine</div>
+      <div class="code-block">
+        <button class="copy-btn" data-copy="./cliptun back --backend file --file /tmp/cliptun">Copy</button>
+        <pre>./cliptun back --backend file --file /tmp/cliptun</pre>
+      </div>
+      <div class="step-label">On the client machine</div>
+      <div class="code-block">
+        <button class="copy-btn" data-copy="./cliptun front --backend file --file /tmp/cliptun">Copy</button>
+        <pre>./cliptun front --backend file --file /tmp/cliptun</pre>
+      </div>
+      <p style="font-size:13.5px;color:var(--muted);margin-top:14px;">Same protocol, same framing — only the transport changes. Useful for local testing or any environment without clipboard support. Omit <code>--file</code> and cliptun falls back to <code>cliptun.clip</code> in the system temp directory.</p>
+    </div>
+  </section>
+
+  <section id="encryption">
+    <div class="section-head">
+      <div class="num">03</div>
+      <h2>Encryption</h2>
+      <p class="sub">Off by default. Turn it on with <code>--encrypt</code> on both sides, backed by a shared key generated once.</p>
+    </div>
+    <div class="step-label">Generate a key (mode 0600, never overwritten)</div>
+    <div class="code-block">
+      <button class="copy-btn" data-copy="./cliptun keygen --out cliptun.key">Copy</button>
+      <pre>./cliptun keygen --out cliptun.key</pre>
+    </div>
+    <div class="step-label">Start both sides with the same key</div>
+    <div class="code-block">
+      <button class="copy-btn" data-copy="./cliptun back  --encrypt --key-file cliptun.key --connect-to 127.0.0.1:8080
+./cliptun front --encrypt --key-file cliptun.key">Copy</button>
+      <pre>./cliptun back  --encrypt --key-file cliptun.key --connect-to 127.0.0.1:8080
+./cliptun front --encrypt --key-file cliptun.key</pre>
+    </div>
+    <div class="table-wrap" style="margin-top:22px;">
+      <table>
+        <tr><th>Aspect</th><th>Choice</th></tr>
+        <tr><td>Cipher</td><td class="mono-cell">XChaCha20-Poly1305 (AEAD)</td></tr>
+        <tr><td>Key</td><td>256-bit, shared, from the OS CSPRNG</td></tr>
+        <tr><td>Nonce</td><td>192-bit, random per frame</td></tr>
+        <tr><td>Overhead</td><td>40 bytes per non-empty frame</td></tr>
+        <tr><td>Downgrade</td><td>plain frames refused in encrypted mode</td></tr>
+      </table>
+    </div>
+    <p style="font-size:13.5px;color:var(--muted);margin-top:14px;">No forward secrecy — the key is a static shared secret. Replay protection resets if Back restarts. See the README for the full threat model.</p>
+  </section>
+
+  <section id="protocol">
+    <div class="section-head">
+      <div class="num">04</div>
+      <h2>How a frame looks</h2>
+      <p class="sub">Every exchange is a half-duplex, stop-and-wait cycle: Front writes a frame, Back answers with the same sequence number, Front dispatches the result and moves on.</p>
+    </div>
+    <div class="code-block">
+      <pre><span class="comment">plain      </span>CT3|&lt;direction&gt;|&lt;gen&gt;|&lt;peer&gt;|&lt;sequence&gt;|&lt;base64(wire)&gt;|&lt;crc32&gt;
+<span class="comment">encrypted  </span>CT4|&lt;direction&gt;|&lt;gen&gt;|&lt;peer&gt;|&lt;sequence&gt;|&lt;base64(wire)&gt;|&lt;crc32&gt;</pre>
+    </div>
+    <div class="pill-row">
+      <span class="pill">Open</span>
+      <span class="pill">Opened</span>
+      <span class="pill">Data</span>
+      <span class="pill">Close</span>
+      <span class="pill">RESET</span>
+    </div>
+    <p style="font-size:13.5px;color:var(--muted);margin-top:14px;">Front always initiates. While no stream is open, Front never touches the clipboard at all.</p>
+  </section>
+
+  <section id="disclaimer">
+    <div class="disclaimer">
+      <h2>Security &amp; usage disclaimer</h2>
+      <ul>
+        <li><strong>Proof of concept, not production software.</strong> cliptun has not been security-audited. Treat it as experimental and review the source before relying on it for anything sensitive.</li>
+        <li><strong>Front has no authentication.</strong> Keep it bound to <code>127.0.0.1</code> — anything that can reach the listener can use the tunnel.</li>
+        <li><strong>No forward secrecy.</strong> The encryption key is a static shared secret; anyone who later obtains it can decrypt traffic captured earlier.</li>
+        <li><strong>The clipboard is shared, not private.</strong> Any process able to read or write the clipboard on either machine can observe metadata (frame sizes, timing, direction) or disrupt the tunnel, encrypted or not.</li>
+        <li><strong>Use only on systems and networks you're authorized to test or operate.</strong> Tunneling traffic to or from a destination without permission may violate laws, terms of service, or organizational policy.</li>
+        <li><strong>No warranty.</strong> Provided as-is, with no guarantee of fitness for any particular purpose. You are responsible for how you deploy and use it.</li>
+      </ul>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <span>cliptun — Rust proof of concept</span>
+  <a href="https://github.com/shoxxdj/cliptun" target="_blank" rel="noopener">github.com/shoxxdj/cliptun</a>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  var tabs = document.querySelectorAll('.tab-btn');
+  tabs.forEach(function(btn){
+    btn.addEventListener('click', function(){
+      tabs.forEach(function(b){
+        b.setAttribute('aria-selected','false');
+        b.tabIndex = -1;
+        document.getElementById(b.getAttribute('aria-controls')).classList.remove('active');
+      });
+      btn.setAttribute('aria-selected','true');
+      btn.tabIndex = 0;
+      document.getElementById(btn.getAttribute('aria-controls')).classList.add('active');
+    });
+  });
+
+  document.querySelectorAll('.copy-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var text = btn.getAttribute('data-copy');
+      var done = function(){
+        var old = btn.textContent;
+        btn.textContent = 'Copied';
+        setTimeout(function(){ btn.textContent = old; }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(function(){
+          fallbackCopy(text); done();
+        });
+      } else {
+        fallbackCopy(text); done();
+      }
+    });
+  });
+
+  function fallbackCopy(text){
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch(e){}
+    document.body.removeChild(ta);
+  }
+})();
+</script>
+
+</body></html>
